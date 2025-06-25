@@ -82,20 +82,21 @@ mkRecords = fmap concat . traverse mkRecord
 mkRecord :: Name -> DecsQ
 mkRecord u = do
     ty <- reify u
-    (typeName, con) <-
+    (typeName, con, tyvars) <-
         case ty of
             TyConI dec ->
                 case dec of
-                    DataD _cxt name _tyvars _mkind [con] _derivs ->
-                        pure (name, con)
-                    NewtypeD _cxt name _tyvars _mkind con _derivs ->
-                        pure (name, con)
+                    DataD _cxt name tyvars _mkind [con] _derivs ->
+                        pure (name, con, tyvars)
+                    NewtypeD _cxt name tyvars _mkind con _derivs ->
+                        pure (name, con, tyvars)
                     _ ->
                         fail "unsupported data structure"
             _ ->
                 fail "unsupported type"
 
     let
+        instanceHead = List.foldl' AppT (ConT typeName) $ fmap getTyVarType tyvars
         stripTypeName n =
             let
                 typeNamePrefix =
@@ -138,7 +139,7 @@ mkRecord u = do
                                     [VarP recVar, VarP newVal]
                                     ( SigE
                                         (RecUpdE (VarE recVar) [(fieldName, VarE newVal)])
-                                        (ConT typeName)
+                                        instanceHead
                                     )
                         )
                         []
@@ -250,17 +251,17 @@ mkRecord u = do
                 [ fieldName
                 ]
                 []
-                (ConT ''Field `AppT` ConT typeName `AppT` typ)
+                (ConT ''Field `AppT` instanceHead `AppT` typ)
 
         recordInstance =
             InstanceD
                 Nothing
                 []
-                (ConT ''Record `AppT` ConT typeName)
+                (ConT ''Record `AppT` instanceHead)
                 ( [ DataInstD
                         []
                         Nothing
-                        (ConT ''Field `AppT` ConT typeName `AppT` VarT (mkName "_"))
+                        (ConT ''Field `AppT` instanceHead `AppT` VarT (mkName "_"))
                         Nothing
                         fieldConstrs
                         []
@@ -290,25 +291,30 @@ mkRecord u = do
             InstanceD
                 Nothing -- maybe overlap
                 allFieldsC
-                (ConT ''FieldDict `AppT` VarT constraintVar `AppT` ConT typeName)
+                (ConT ''FieldDict `AppT` VarT constraintVar `AppT` instanceHead)
                 fieldDictDecl
 
     symbolToFieldInstances <-
         fmap concat $ for names'types $ \(fieldName, typ) -> do
+            retType <- newName "field"
             [d|
                 instance
-                    SymbolToField
+                    ($(varT retType) ~ $(pure typ))
+                    => SymbolToField
                         $(litT (strTyLit (nameBase fieldName)))
-                        $(conT typeName)
-                        $(pure typ)
+                        $(pure instanceHead)
+                        $(varT retType)
                     where
                     symbolToField = $(conE (mkConstrFieldName fieldName))
                 |]
 
+    eqInstance <-
+        [d|deriving stock instance Eq (Field $(pure instanceHead) a)|]
+
     pure $
         [ recordInstance
         , fieldDictInstance
-        ]
+        ] <> eqInstance
             ++ symbolToFieldInstances
 
 overFirst :: (Char -> Char) -> String -> String
@@ -320,6 +326,10 @@ overFirst f str =
 upperFirst, lowerFirst :: String -> String
 upperFirst = overFirst toUpper
 lowerFirst = overFirst toLower
+
+getTyVarType :: TyVarBndr a -> Type
+getTyVarType (PlainTV n _) = VarT n
+getTyVarType (KindedTV n _ _) = VarT n
 
 compatConP :: Name -> Pat
 #if MIN_VERSION_template_haskell(2,18,0)
@@ -336,5 +346,5 @@ compatConP' constrFieldName ps =
     ConP constrFieldName [] ps
 #else
 compatConP' constrFieldName ps  =
-    ConP constrFieldName ps 
+    ConP constrFieldName ps
 #endif
